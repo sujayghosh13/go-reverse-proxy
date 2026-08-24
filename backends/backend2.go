@@ -1,15 +1,23 @@
 package main
 
 import (
-    "fmt"
-    "net/http"
+	"fmt"
+	"log"
+	"net/http"
 )
 
 func main() {
-    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        fmt.Fprintln(w, "Hello from Backend 2!")
-    })
+	port := ":9002"
+	name := "Backend 2"
 
-    fmt.Println("Backend 2 running on port 9002")
-    http.ListenAndServe(":9002", nil)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[%s] %s %s from %s", name, r.Method, r.URL.Path, r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintln(w, "Hello from Backend 2!")
+	})
+
+	log.Printf("%s starting on port %s...", name, port)
+	if err := http.ListenAndServe(port, nil); err != nil {
+		log.Fatalf("[%s] Failed to start server: %v", name, err)
+	}
 }
