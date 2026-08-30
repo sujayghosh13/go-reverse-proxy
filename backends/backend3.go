@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 )
@@ -12,6 +13,10 @@ func main() {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[%s] %s %s from %s", name, r.Method, r.URL.Path, r.RemoteAddr)
+		body, _ := io.ReadAll(r.Body)
+		defer r.Body.Close()
+		_ = body
+
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "Hello from Backend 3!")
 	})

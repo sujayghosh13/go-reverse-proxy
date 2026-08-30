@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,11 +19,7 @@ type Backend struct {
 }
 
 // List of backend servers
-var backends = []*Backend{
-	{Address: "localhost:9001", Healthy: true},
-	{Address: "localhost:9002", Healthy: true},
-	{Address: "localhost:9003", Healthy: true},
-}
+var backends []*Backend
 
 // Variables for Round Robin
 var (
@@ -90,8 +89,12 @@ func getNextBackend() *Backend {
 	return nil
 }
 
-// Check backend health every 5 seconds
-func healthCheck() {
+// Check backend health periodically
+func healthCheck(intervalSeconds int) {
+	interval := time.Duration(intervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	for {
 		for _, b := range backends {
 
@@ -119,7 +122,7 @@ func healthCheck() {
 			}
 		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(interval)
 	}
 }
 
@@ -128,6 +131,7 @@ func readRequest(clientConn net.Conn) ([]byte, error) {
 	reader := bufio.NewReader(clientConn)
 
 	var request []byte
+	contentLength := 0
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -138,10 +142,29 @@ func readRequest(clientConn net.Conn) ([]byte, error) {
 
 		request = append(request, []byte(line)...)
 
+		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				val := strings.TrimSpace(parts[1])
+				if cl, err := strconv.Atoi(val); err == nil {
+					contentLength = cl
+				}
+			}
+		}
+
 		// Empty line means HTTP headers are finished
 		if line == "\r\n" {
 			break
 		}
+	}
+
+	if contentLength > 0 {
+		body := make([]byte, contentLength)
+		_, err := io.ReadFull(reader, body)
+		if err != nil {
+			return nil, err
+		}
+		request = append(request, body...)
 	}
 
 	return request, nil
@@ -162,11 +185,18 @@ func forwardToBackend(
 
 	// Send request to backend
 	_, writeErr := backendConn.Write(request)
+	var resp *http.Response
 
-	if writeErr != nil {
+	if writeErr == nil {
+		reader := bufio.NewReader(backendConn)
+		resp, err = http.ReadResponse(reader, nil)
+	}
+
+	// If writing or reading failed on a pooled connection, retry with a fresh connection!
+	if writeErr != nil || err != nil {
 
 		// The pooled connection may be stale or closed
-		fmt.Println("Pooled connection failed, creating a fresh connection")
+		fmt.Println("Pooled connection failed or stale, creating a fresh connection")
 
 		backendConn.Close()
 
@@ -185,17 +215,16 @@ func forwardToBackend(
 
 			return nil, nil, writeErr
 		}
-	}
 
-	// Read backend response
-	reader := bufio.NewReader(backendConn)
+		reader := bufio.NewReader(backendConn)
 
-	resp, err := http.ReadResponse(reader, nil)
+		resp, err = http.ReadResponse(reader, nil)
 
-	if err != nil {
-		backendConn.Close()
+		if err != nil {
+			backendConn.Close()
 
-		return nil, nil, err
+			return nil, nil, err
+		}
 	}
 
 	return resp, backendConn, nil
@@ -261,8 +290,24 @@ func handleConnection(clientConn net.Conn) {
 
 func main() {
 
-	// Start reverse proxy on port 8080
-	listener, err := net.Listen("tcp", ":8080")
+	// Load configuration from config.yaml
+	cfg, err := loadConfig("config.yaml")
+	if err != nil {
+		fmt.Println("Error loading config file:", err)
+		return
+	}
+
+	// Initialize backend list from config
+	for _, addr := range cfg.Backends {
+		backends = append(backends, &Backend{
+			Address: addr,
+			Healthy: true,
+		})
+	}
+
+	// Start reverse proxy on configured port
+	listenAddr := fmt.Sprintf(":%d", cfg.Port)
+	listener, err := net.Listen("tcp", listenAddr)
 
 	if err != nil {
 
@@ -274,9 +319,9 @@ func main() {
 	defer listener.Close()
 
 	// Run health checking in a separate goroutine
-	go healthCheck()
+	go healthCheck(cfg.HealthCheckIntervalSeconds)
 
-	fmt.Println("Proxy is listening on port 8080...")
+	fmt.Printf("Proxy is listening on port %d...\n", cfg.Port)
 
 	// Accept client connections
 	for {
