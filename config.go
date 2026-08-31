@@ -15,6 +15,8 @@ type Config struct {
 	CircuitBreakerCooldownSeconds int      `yaml:"circuit_breaker_cooldown_seconds"`
 	LogLevel                      string   `yaml:"log_level"`
 	LogJSON                       bool     `yaml:"log_json"`
+	CacheEnabled                  bool     `yaml:"cache_enabled"`
+	CacheTTLSeconds               int      `yaml:"cache_ttl_seconds"`
 }
 
 // loadConfig reads and unmarshals the YAML configuration file from path

@@ -4,6 +4,8 @@ circuit_breaker_threshold: 3
 circuit_breaker_cooldown_seconds: 5
 log_level: "INFO"
 log_json: true
+cache_enabled: true
+cache_ttl_seconds: 30
 backends:
   - localhost:9001
   - localhost:9002

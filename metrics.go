@@ -73,4 +73,12 @@ func (m *Metrics) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	mu.Unlock()
+
+	fmt.Fprintln(w, "\n# HELP proxy_cache_hits_total Total response cache hits.")
+	fmt.Fprintln(w, "# TYPE proxy_cache_hits_total counter")
+	fmt.Fprintf(w, "proxy_cache_hits_total %d\n\n", globalCache.Hits())
+
+	fmt.Fprintln(w, "# HELP proxy_cache_misses_total Total response cache misses.")
+	fmt.Fprintln(w, "# TYPE proxy_cache_misses_total counter")
+	fmt.Fprintf(w, "proxy_cache_misses_total %d\n", globalCache.Misses())
 }

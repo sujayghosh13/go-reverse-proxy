@@ -290,10 +290,21 @@ func handleConnection(clientConn net.Conn) {
 	// Extract or generate X-Request-ID
 	requestID, request := ExtractOrGenerateRequestID(rawRequest)
 
+	// Check response cache for GET requests
+	cacheKey, method := ExtractCacheKey(rawRequest)
+	if cacheKey != "" {
+		if cachedResp, ok := globalCache.Get(cacheKey); ok {
+			globalMetrics.RecordRequest("", false)
+			LogRequest(slog.LevelInfo, "Response cache HIT", requestID, method, "CACHE", 200, time.Since(start), nil)
+			clientConn.Write(cachedResp)
+			return
+		}
+	}
+
 	// Rate limit check per client IP
 	if !globalRateLimiter.Allow(clientIP) {
 		globalMetrics.RecordRequest("", true)
-		LogRequest(slog.LevelWarn, "Rate limit exceeded", requestID, "", "", 429, time.Since(start), nil)
+		LogRequest(slog.LevelWarn, "Rate limit exceeded", requestID, method, "", 429, time.Since(start), nil)
 		clientConn.Write([]byte(
 			fmt.Sprintf(
 				"HTTP/1.1 429 Too Many Requests\r\n"+
@@ -316,7 +327,7 @@ func handleConnection(clientConn net.Conn) {
 
 	if target == nil {
 		globalMetrics.RecordRequest("", true)
-		LogRequest(slog.LevelError, "All backends unavailable", requestID, "", "", 503, time.Since(start), nil)
+		LogRequest(slog.LevelError, "All backends unavailable", requestID, method, "", 503, time.Since(start), nil)
 
 		// All backends are unavailable
 		clientConn.Write([]byte(
@@ -360,7 +371,7 @@ func handleConnection(clientConn net.Conn) {
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		LogRequest(slog.LevelError, "Backend error", requestID, "", target.Address, 502, time.Since(start), err)
+		LogRequest(slog.LevelError, "Backend error", requestID, method, target.Address, 502, time.Since(start), err)
 
 		clientConn.Write([]byte(
 			fmt.Sprintf(
@@ -383,15 +394,37 @@ func handleConnection(clientConn net.Conn) {
 	// Ensure X-Request-ID is present in response headers returned to client
 	InjectResponseRequestID(resp, requestID)
 
-	// Send backend response to client
-	err = resp.Write(clientConn)
+	// Read response body for caching and forwarding
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
 	if err != nil {
 		globalMetrics.RecordRequest(target.Address, true)
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		LogRequest(slog.LevelError, "Error writing response to client", requestID, "", target.Address, 500, time.Since(start), err)
+		LogRequest(slog.LevelError, "Error reading response body from backend", requestID, method, target.Address, 500, time.Since(start), err)
+		backendConn.Close()
+		return
+	}
+
+	// Build raw response bytes
+	respBytes := BuildResponseBytes(resp, bodyBytes)
+
+	// Store in cache if 200 OK and GET request
+	if cacheKey != "" && resp.StatusCode == 200 {
+		globalCache.Put(cacheKey, respBytes, resp.StatusCode)
+	}
+
+	// Send backend response to client
+	_, err = clientConn.Write(respBytes)
+
+	if err != nil {
+		globalMetrics.RecordRequest(target.Address, true)
+		if target.CB != nil {
+			target.CB.RecordFailure()
+		}
+		LogRequest(slog.LevelError, "Error writing response to client", requestID, method, target.Address, 500, time.Since(start), err)
 
 		backendConn.Close()
 
@@ -403,7 +436,7 @@ func handleConnection(clientConn net.Conn) {
 		target.CB.RecordSuccess()
 	}
 
-	LogRequest(slog.LevelInfo, "Request processed successfully", requestID, "", target.Address, resp.StatusCode, time.Since(start), nil)
+	LogRequest(slog.LevelInfo, "Request processed successfully", requestID, method, target.Address, resp.StatusCode, time.Since(start), nil)
 
 	// Put the backend connection back into the pool
 	pool.Put(target.Address, backendConn)
@@ -417,6 +450,13 @@ func main() {
 		fmt.Println("Error loading config file:", err)
 		return
 	}
+
+	// Initialize global response cache
+	cacheTTL := time.Duration(cfg.CacheTTLSeconds) * time.Second
+	if cacheTTL <= 0 {
+		cacheTTL = 30 * time.Second
+	}
+	globalCache = NewResponseCache(cfg.CacheEnabled, cacheTTL)
 
 	// Initialize structured logger from config
 	logLevel := cfg.LogLevel
