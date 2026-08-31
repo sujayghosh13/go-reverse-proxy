@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  backend1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["./backend1"]
+    ports:
+      - "9001:9001"
+    networks:
+      - proxy-net
+
+  backend2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["./backend2"]
+    ports:
+      - "9002:9002"
+    networks:
+      - proxy-net
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["./backend3"]
+    ports:
+      - "9003:9003"
+    networks:
+      - proxy-net
+
+  reverse-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
+    driver: bridge
