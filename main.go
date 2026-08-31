@@ -498,6 +498,8 @@ func main() {
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/metrics", globalMetrics.MetricsHandler)
+		mux.HandleFunc("/healthz", HealthzHandler)
+		mux.HandleFunc("/readyz", ReadyzHandler)
 		fmt.Println("Metrics server listening on port 9090...")
 		if err := http.ListenAndServe(":9090", mux); err != nil {
 			fmt.Println("Metrics server error:", err)

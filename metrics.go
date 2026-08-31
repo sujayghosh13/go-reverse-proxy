@@ -78,7 +78,43 @@ func (m *Metrics) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "# TYPE proxy_cache_hits_total counter")
 	fmt.Fprintf(w, "proxy_cache_hits_total %d\n\n", globalCache.Hits())
 
-	fmt.Fprintln(w, "# HELP proxy_cache_misses_total Total response cache misses.")
+	fmt.Fprintln(w, "\n# HELP proxy_cache_misses_total Total response cache misses.")
 	fmt.Fprintln(w, "# TYPE proxy_cache_misses_total counter")
 	fmt.Fprintf(w, "proxy_cache_misses_total %d\n", globalCache.Misses())
+}
+
+// HealthzHandler serves Kubernetes liveness probe requests
+func HealthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK\n"))
+}
+
+// ReadyzHandler serves Kubernetes readiness probe requests
+func ReadyzHandler(w http.ResponseWriter, r *http.Request) {
+	shutdownMu.Lock()
+	shuttingDown := isShuttingDown
+	shutdownMu.Unlock()
+
+	if shuttingDown {
+		http.Error(w, "Service Shutting Down", http.StatusServiceUnavailable)
+		return
+	}
+
+	mu.Lock()
+	hasHealthy := false
+	for _, b := range backends {
+		if b.Healthy && (b.CB == nil || b.CB.State() != StateOpen) {
+			hasHealthy = true
+			break
+		}
+	}
+	mu.Unlock()
+
+	if !hasHealthy {
+		http.Error(w, "No Healthy Backends Available", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("READY\n"))
 }
