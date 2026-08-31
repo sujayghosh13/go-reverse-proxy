@@ -27,31 +27,50 @@ var (
 	mu      sync.Mutex
 )
 
+const (
+	maxIdleConnsPerBackend = 10
+	maxIdleTime            = 30 * time.Second
+)
+
+// pooledConn wraps a net.Conn with its return timestamp
+type pooledConn struct {
+	conn       net.Conn
+	returnedAt time.Time
+}
+
 // ConnPool manages reusable TCP connections
 type ConnPool struct {
 	mu    sync.Mutex
-	conns map[string][]net.Conn
+	conns map[string][]pooledConn
 }
 
 // Create a new connection pool
 func NewConnPool() *ConnPool {
 	return &ConnPool{
-		conns: make(map[string][]net.Conn),
+		conns: make(map[string][]pooledConn),
 	}
 }
 
 // Get a connection from the pool
 func (p *ConnPool) Get(address string) (net.Conn, error) {
 	p.mu.Lock()
-	conns := p.conns[address]
-	if len(conns) > 0 {
-		conn := conns[len(conns)-1]
+	for len(p.conns[address]) > 0 {
+		conns := p.conns[address]
+		pc := conns[len(conns)-1]
 		p.conns[address] = conns[:len(conns)-1]
+
+		if time.Since(pc.returnedAt) > maxIdleTime {
+			pc.conn.Close()
+			fmt.Println("Discarded stale pooled connection to", address)
+			continue
+		}
+
 		p.mu.Unlock()
 		fmt.Println("Reused a pooled connection to", address)
-		return conn, nil
+		return pc.conn, nil
 	}
 	p.mu.Unlock()
+
 	fmt.Println("No pooled connection available, dialing fresh to", address)
 	return net.Dial("tcp", address)
 }
@@ -61,7 +80,16 @@ func (p *ConnPool) Put(address string, conn net.Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.conns[address] = append(p.conns[address], conn)
+	if len(p.conns[address]) >= maxIdleConnsPerBackend {
+		conn.Close()
+		fmt.Println("Pool full for", address, "- closed connection")
+		return
+	}
+
+	p.conns[address] = append(p.conns[address], pooledConn{
+		conn:       conn,
+		returnedAt: time.Now(),
+	})
 
 	fmt.Println("Returned connection to pool for", address)
 }
@@ -238,6 +266,7 @@ func handleConnection(clientConn net.Conn) {
 	target := getNextBackend()
 
 	if target == nil {
+		globalMetrics.RecordRequest("", true)
 
 		// All backends are unavailable
 		clientConn.Write([]byte(
@@ -253,6 +282,7 @@ func handleConnection(clientConn net.Conn) {
 	request, err := readRequest(clientConn)
 
 	if err != nil {
+		globalMetrics.RecordRequest(target.Address, true)
 		fmt.Println("Error reading client request:", err)
 
 		return
@@ -262,7 +292,7 @@ func handleConnection(clientConn net.Conn) {
 	resp, backendConn, err := forwardToBackend(target, request)
 
 	if err != nil {
-
+		globalMetrics.RecordRequest(target.Address, true)
 		fmt.Println("Error talking to backend:", err)
 
 		clientConn.Write([]byte(
@@ -276,13 +306,15 @@ func handleConnection(clientConn net.Conn) {
 	err = resp.Write(clientConn)
 
 	if err != nil {
-
+		globalMetrics.RecordRequest(target.Address, true)
 		fmt.Println("Error writing response to client:", err)
 
 		backendConn.Close()
 
 		return
 	}
+
+	globalMetrics.RecordRequest(target.Address, false)
 
 	// Put the backend connection back into the pool
 	pool.Put(target.Address, backendConn)
@@ -304,6 +336,16 @@ func main() {
 			Healthy: true,
 		})
 	}
+
+	// Start HTTP metrics server on port 9090
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", globalMetrics.MetricsHandler)
+		fmt.Println("Metrics server listening on port 9090...")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			fmt.Println("Metrics server error:", err)
+		}
+	}()
 
 	// Start reverse proxy on configured port
 	listenAddr := fmt.Sprintf(":%d", cfg.Port)
