@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -398,14 +399,23 @@ func main() {
 		}
 	}()
 
-	// Start reverse proxy on configured port
+	// Load TLS certificate and private key for HTTPS TLS termination
+	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		fmt.Println("Error loading TLS certificate/key:", err)
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	// Start HTTPS reverse proxy on configured port with TLS listener
 	listenAddr := fmt.Sprintf(":%d", cfg.Port)
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := tls.Listen("tcp", listenAddr, tlsConfig)
 
 	if err != nil {
-
-		fmt.Println("Error starting server:", err)
-
+		fmt.Println("Error starting TLS server:", err)
 		return
 	}
 
