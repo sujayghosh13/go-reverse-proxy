@@ -1,5 +1,14 @@
 # Go Reverse Proxy & Load Balancer — Built From Scratch
 
+![Go Version](https://img.shields.io/badge/Go-1.21%2B-00ADD8?style=for-the-badge&logo=go)
+![Architecture](https://img.shields.io/badge/Architecture-Raw_TCP_Sockets-FF6C37?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub_Actions-blue?style=for-the-badge&logo=githubactions)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-Probes_%26_Manifests-326CE5?style=for-the-badge&logo=kubernetes)
+
+> **Repository Description:** A high-performance, resilient HTTP/HTTPS Reverse Proxy & Load Balancer built in Go from raw TCP sockets (`net.Listen`, `net.Dial`, `crypto/tls`). Features least-connections load balancing, per-backend circuit breaking, token-bucket rate limiting, response caching, structured logging (`log/slog`), Prometheus metrics, and a real-time web dashboard.
+
 A production-oriented reverse proxy and load balancer implemented in Go directly from raw TCP sockets (`net.Listen`, `net.Dial`, `crypto/tls`). 
 
 The core proxy forwarding engine **does not use Go's standard `net/http` reverse-proxy package (`httputil.ReverseProxy`)** or third-party proxy libraries. It was built from first principles to gain a deep systems-level understanding of the mechanics powering enterprise edge proxies like Nginx and HAProxy — including TCP socket networking, HTTP protocol parsing, concurrency synchronization, load balancing algorithms, health checks, circuit breaking, connection pooling, rate limiting, TLS termination, structured logging, observability, and graceful application lifecycle management.
