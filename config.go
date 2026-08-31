@@ -13,6 +13,8 @@ type Config struct {
 	Backends                      []string `yaml:"backends"`
 	CircuitBreakerThreshold       int      `yaml:"circuit_breaker_threshold"`
 	CircuitBreakerCooldownSeconds int      `yaml:"circuit_breaker_cooldown_seconds"`
+	LogLevel                      string   `yaml:"log_level"`
+	LogJSON                       bool     `yaml:"log_json"`
 }
 
 // loadConfig reads and unmarshals the YAML configuration file from path

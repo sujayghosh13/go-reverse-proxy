@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -271,6 +272,7 @@ func forwardToBackend(
 // Handle each client connection
 func handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
+	start := time.Now()
 
 	// Extract client IP (host only, stripping ephemeral port)
 	clientIP, _, err := net.SplitHostPort(clientConn.RemoteAddr().String())
@@ -281,7 +283,7 @@ func handleConnection(clientConn net.Conn) {
 	// Read client's HTTP request to drain incoming TCP receive buffer
 	rawRequest, err := readRequest(clientConn)
 	if err != nil {
-		fmt.Println("Error reading client request:", err)
+		LogRequest(slog.LevelError, "Error reading client request", "", "", "", 400, time.Since(start), err)
 		return
 	}
 
@@ -291,6 +293,7 @@ func handleConnection(clientConn net.Conn) {
 	// Rate limit check per client IP
 	if !globalRateLimiter.Allow(clientIP) {
 		globalMetrics.RecordRequest("", true)
+		LogRequest(slog.LevelWarn, "Rate limit exceeded", requestID, "", "", 429, time.Since(start), nil)
 		clientConn.Write([]byte(
 			fmt.Sprintf(
 				"HTTP/1.1 429 Too Many Requests\r\n"+
@@ -313,6 +316,7 @@ func handleConnection(clientConn net.Conn) {
 
 	if target == nil {
 		globalMetrics.RecordRequest("", true)
+		LogRequest(slog.LevelError, "All backends unavailable", requestID, "", "", 503, time.Since(start), nil)
 
 		// All backends are unavailable
 		clientConn.Write([]byte(
@@ -346,7 +350,7 @@ func handleConnection(clientConn net.Conn) {
 		mu.Unlock()
 	}()
 
-	fmt.Printf("[%s] Least-connections selected: %s (active: %d)\n", requestID, target.Address, activeCount)
+	Logger.Debug("Selected backend", "request_id", requestID, "backend", target.Address, "active_conns", activeCount)
 
 	// Forward request to backend
 	resp, backendConn, err := forwardToBackend(target, request)
@@ -356,7 +360,7 @@ func handleConnection(clientConn net.Conn) {
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		fmt.Printf("[%s] Error talking to backend %s: %v\n", requestID, target.Address, err)
+		LogRequest(slog.LevelError, "Backend error", requestID, "", target.Address, 502, time.Since(start), err)
 
 		clientConn.Write([]byte(
 			fmt.Sprintf(
@@ -387,7 +391,7 @@ func handleConnection(clientConn net.Conn) {
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		fmt.Printf("[%s] Error writing response to client: %v\n", requestID, err)
+		LogRequest(slog.LevelError, "Error writing response to client", requestID, "", target.Address, 500, time.Since(start), err)
 
 		backendConn.Close()
 
@@ -398,6 +402,8 @@ func handleConnection(clientConn net.Conn) {
 	if target.CB != nil {
 		target.CB.RecordSuccess()
 	}
+
+	LogRequest(slog.LevelInfo, "Request processed successfully", requestID, "", target.Address, resp.StatusCode, time.Since(start), nil)
 
 	// Put the backend connection back into the pool
 	pool.Put(target.Address, backendConn)
@@ -411,6 +417,13 @@ func main() {
 		fmt.Println("Error loading config file:", err)
 		return
 	}
+
+	// Initialize structured logger from config
+	logLevel := cfg.LogLevel
+	if logLevel == "" {
+		logLevel = "INFO"
+	}
+	InitLogger(logLevel, cfg.LogJSON)
 
 	cbThreshold := cfg.CircuitBreakerThreshold
 	if cbThreshold <= 0 {

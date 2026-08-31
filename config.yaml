@@ -2,6 +2,8 @@ port: 8080
 health_check_interval_seconds: 5
 circuit_breaker_threshold: 3
 circuit_breaker_cooldown_seconds: 5
+log_level: "INFO"
+log_json: true
 backends:
   - localhost:9001
   - localhost:9002
