@@ -6,25 +6,32 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // Backend represents a backend server
 type Backend struct {
-	Address string
-	Healthy bool
+	Address           string
+	Healthy           bool
+	ActiveConnections int
 }
 
 // List of backend servers
 var backends []*Backend
 
-// Variables for Round Robin
+// Variables for backend locking and Graceful Shutdown
 var (
-	counter int
-	mu      sync.Mutex
+	counter        int
+	mu             sync.Mutex
+	wg             sync.WaitGroup
+	isShuttingDown bool
+	shutdownMu     sync.Mutex
 )
 
 const (
@@ -97,24 +104,22 @@ func (p *ConnPool) Put(address string, conn net.Conn) {
 // Create the global connection pool
 var pool = NewConnPool()
 
-// Select the next healthy backend using Round Robin
-func getNextBackend() *Backend {
+// Select the healthy backend with the fewest active connections
+func getLeastConnectionsBackend() *Backend {
 	mu.Lock()
 	defer mu.Unlock()
 
-	for i := 0; i < len(backends); i++ {
-		backend := backends[counter%len(backends)]
-
-		counter++
-
-		// Only select healthy backends
-		if backend.Healthy {
-			return backend
+	var best *Backend
+	for _, backend := range backends {
+		if !backend.Healthy {
+			continue
+		}
+		if best == nil || backend.ActiveConnections < best.ActiveConnections {
+			best = backend
 		}
 	}
 
-	// All backends are down
-	return nil
+	return best
 }
 
 // Check backend health periodically
@@ -262,31 +267,70 @@ func forwardToBackend(
 func handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// Select the next healthy backend
-	target := getNextBackend()
+	// Extract client IP (host only, stripping ephemeral port)
+	clientIP, _, err := net.SplitHostPort(clientConn.RemoteAddr().String())
+	if err != nil {
+		clientIP = clientConn.RemoteAddr().String()
+	}
+
+	// Read client's HTTP request to drain incoming TCP receive buffer
+	request, err := readRequest(clientConn)
+	if err != nil {
+		fmt.Println("Error reading client request:", err)
+		return
+	}
+
+	// Rate limit check per client IP
+	if !globalRateLimiter.Allow(clientIP) {
+		globalMetrics.RecordRequest("", true)
+		clientConn.Write([]byte(
+			"HTTP/1.1 429 Too Many Requests\r\n" +
+				"Content-Type: text/plain; charset=utf-8\r\n" +
+				"Content-Length: 19\r\n" +
+				"Connection: close\r\n\r\n" +
+				"Rate limit exceeded",
+		))
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
+		return
+	}
+
+	// Select the healthy backend with the fewest active connections
+	target := getLeastConnectionsBackend()
 
 	if target == nil {
 		globalMetrics.RecordRequest("", true)
 
 		// All backends are unavailable
 		clientConn.Write([]byte(
-			"HTTP/1.1 503 Service Unavailable\r\n\r\nAll backends are down",
+			"HTTP/1.1 503 Service Unavailable\r\n" +
+				"Content-Type: text/plain; charset=utf-8\r\n" +
+				"Content-Length: 21\r\n" +
+				"Connection: close\r\n\r\n" +
+				"All backends are down",
 		))
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 
 		return
 	}
 
-	fmt.Println("Selected backend:", target.Address)
+	// Increment active connections for selected backend
+	mu.Lock()
+	target.ActiveConnections++
+	activeCount := target.ActiveConnections
+	mu.Unlock()
 
-	// Read the client's HTTP request
-	request, err := readRequest(clientConn)
+	// Ensure active connections count is decremented when handleConnection exits
+	defer func() {
+		mu.Lock()
+		target.ActiveConnections--
+		mu.Unlock()
+	}()
 
-	if err != nil {
-		globalMetrics.RecordRequest(target.Address, true)
-		fmt.Println("Error reading client request:", err)
-
-		return
-	}
+	fmt.Println("Least-connections selected:", target.Address, "active:", activeCount)
 
 	// Forward request to backend
 	resp, backendConn, err := forwardToBackend(target, request)
@@ -296,8 +340,15 @@ func handleConnection(clientConn net.Conn) {
 		fmt.Println("Error talking to backend:", err)
 
 		clientConn.Write([]byte(
-			"HTTP/1.1 502 Bad Gateway\r\n\r\nBackend error",
+			"HTTP/1.1 502 Bad Gateway\r\n" +
+				"Content-Type: text/plain; charset=utf-8\r\n" +
+				"Content-Length: 13\r\n" +
+				"Connection: close\r\n\r\n" +
+				"Backend error",
 		))
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 
 		return
 	}
@@ -358,12 +409,25 @@ func main() {
 		return
 	}
 
-	defer listener.Close()
-
 	// Run health checking in a separate goroutine
 	go healthCheck(cfg.HealthCheckIntervalSeconds)
 
 	fmt.Printf("Proxy is listening on port %d...\n", cfg.Port)
+
+	// Listen for shutdown signals (Ctrl+C / SIGTERM)
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-shutdownChan
+		fmt.Println("Shutdown signal received. Finishing in-flight requests...")
+
+		shutdownMu.Lock()
+		isShuttingDown = true
+		shutdownMu.Unlock()
+
+		listener.Close()
+	}()
 
 	// Accept client connections
 	for {
@@ -371,13 +435,37 @@ func main() {
 		conn, err := listener.Accept()
 
 		if err != nil {
+			shutdownMu.Lock()
+			shuttingDown := isShuttingDown
+			shutdownMu.Unlock()
+
+			if shuttingDown {
+				break
+			}
 
 			fmt.Println("Error accepting connection:", err)
 
 			continue
 		}
 
-		// Handle every client concurrently
-		go handleConnection(conn)
+		shutdownMu.Lock()
+		if isShuttingDown {
+			shutdownMu.Unlock()
+			conn.Close()
+			break
+		}
+
+		wg.Add(1)
+		shutdownMu.Unlock()
+
+		// Handle every client concurrently and track in-flight requests
+		go func(c net.Conn) {
+			defer wg.Done()
+			handleConnection(c)
+		}(conn)
 	}
+
+	// Wait for all in-flight requests to complete
+	wg.Wait()
+	fmt.Println("All requests completed. Shutting down cleanly.")
 }

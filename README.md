@@ -5,11 +5,13 @@ A high-performance reverse proxy and load balancer built from raw TCP sockets in
 ## Key Features
 
 - **Raw TCP Socket Processing:** Accepts incoming client HTTP requests over raw TCP listeners (`net.Listen`) and parses HTTP headers manually.
+- **Per-Client Token Bucket Rate Limiting:** Enforces rate limiting per client IP (5-token burst capacity, 1 token/sec refill rate) with compliant HTTP `429 Too Many Requests` responses.
+- **Least-Connections Load Balancing:** Dynamically routes client requests to the healthy backend with the lowest active connection count (`getLeastConnectionsBackend()`).
+- **Graceful Shutdown:** Catches `os.Interrupt` (Ctrl+C) and `SIGTERM` signals, closes the TCP listener to stop new connections, waits for all in-flight requests to complete via `sync.WaitGroup`, and exits cleanly.
 - **Connection Pooling & Idle Cleanup (`ConnPool`):** Maintains an in-memory thread-safe connection pool of persistent backend TCP sockets (`pooledConn`). Limits idle sockets to 10 per backend and automatically closes/discards connections idle for $> 30\text{s}$.
 - **HTTP Request Body Support:** Parses `Content-Length` headers and streams exact body bytes using `io.ReadFull` for GET, POST, PUT, JSON, and Form payloads.
 - **YAML Config File Support (`config.yaml`):** Externalized configuration for proxy port, health check probe intervals, and backend server target lists using `gopkg.in/yaml.v3`.
 - **Prometheus Metrics Endpoint (`:9090/metrics`):** Runs a separate `net/http` server on port 9090 tracking total requests, error rates, and per-backend traffic counters in Prometheus plain-text format.
-- **Round-Robin Load Balancing:** Evenly distributes client traffic across active backends using a thread-safe mutex counter.
 - **Active Health Checks & Failover:** Periodically pings backends on a configurable interval; automatically removes unhealthy nodes from rotation and restores them upon recovery.
 - **Resilient Fallbacks:** Gracefully handles stale/closed pooled connections with automatic fresh socket reconnect retries and returns `503 Service Unavailable` if all backends are down.
 - **High Concurrency:** Concurrent request handling powered by Go goroutines and `sync.Mutex` synchronization.
@@ -17,10 +19,13 @@ A high-performance reverse proxy and load balancer built from raw TCP sockets in
 ## Architecture
 
 ```
-Client  --->  Reverse Proxy (Configured Port, e.g. :8080)  --->  Backend 1 (:9001)
-                     |                                              
-                     |--- Round-Robin / Connection Pool --------->  Backend 2 (:9002)
-                     |                                              
+Client  --->  Token Bucket Rate Limiter (Per IP)
+                     |
+                     v
+             Reverse Proxy (Configured Port, e.g. :8080)
+                     |
+                     |--- Least-Connections / Connection Pool --->  Backend 1 (:9001)
+                     |                                              Backend 2 (:9002)
                      |--- Active Health Checks ------------------>  Backend 3 (:9003)
                      |
                      v
@@ -28,14 +33,17 @@ Client  --->  Reverse Proxy (Configured Port, e.g. :8080)  --->  Backend 1 (:900
 ```
 
 1. Client connects to the proxy on port configured in `config.yaml` (default `:8080`).
-2. Proxy parses incoming HTTP headers line-by-line and extracts `Content-Length` for request body payloads.
-3. `getNextBackend()` selects the next **healthy** backend in rotation (round-robin).
-4. Proxy retrieves an idle TCP connection from `ConnPool` (verifying connection is $\le 30\text{s}$ old; dials a fresh connection if empty/stale).
-5. Request and body payload are forwarded to the backend.
-6. Backend response is parsed (`http.ReadResponse`) and written to the client (`resp.Write`).
-7. Connection is returned to `ConnPool` (if pool count $< 10$; otherwise connection is closed).
-8. `globalMetrics.RecordRequest()` records success/error metrics.
-9. Background `healthCheck` goroutine pings backends on the interval specified in `config.yaml`.
+2. Proxy checks rate limit for client IP (`globalRateLimiter.Allow(clientIP)`). If exceeded, returns HTTP 429.
+3. Proxy parses incoming HTTP headers line-by-line and extracts `Content-Length` for request body payloads.
+4. `getLeastConnectionsBackend()` selects the healthy backend with the fewest active connections.
+5. Proxy retrieves an idle TCP connection from `ConnPool` (verifying connection is $\le 30\text{s}$ old; dials a fresh connection if empty/stale).
+6. Request and body payload are forwarded to the backend.
+7. Backend response is parsed (`http.ReadResponse`) and written to the client (`resp.Write`).
+8. Connection is returned to `ConnPool` (if pool count $< 10$; otherwise connection is closed).
+9. Active connection count is decremented upon request completion.
+10. `globalMetrics.RecordRequest()` records success/error metrics.
+11. Background `healthCheck` goroutine pings backends on the interval specified in `config.yaml`.
+12. On Ctrl+C (`SIGTERM`), proxy closes listener, waits for in-flight requests via `sync.WaitGroup`, and shuts down gracefully.
 
 ## Configuration (`config.yaml`)
 
@@ -78,7 +86,7 @@ proxy_backend_requests_total{backend="localhost:9003"} 4
 ## Tech Stack
 
 - **Language:** Go 1.26+
-- **Concurrency:** Goroutines & `sync.Mutex`
+- **Concurrency:** Goroutines, `sync.Mutex`, `sync.WaitGroup`
 - **Config Parser:** `gopkg.in/yaml.v3`
 - **Networking:** `net.Listen`, `net.Dial`, `bufio`, `io`, `net/http`
 
@@ -149,15 +157,19 @@ Tested with [`hey`](https://github.com/rakyll/hey), 2000 requests at 50 concurre
 - [x] **Support for HTTP request bodies** (`Content-Length` detection & `io.ReadFull` payload streaming)
 - [x] **YAML Config File Support** (`config.yaml` + `config.go` for port, health check interval, and backends)
 - [x] **Structured metrics endpoint (`/metrics`) for observability** (Prometheus plain-text server on port 9090)
-- [ ] Weighted round-robin / least-connections load balancing strategies
+- [x] **Per-client Token Bucket Rate Limiting** (5 burst tokens, 1 token/sec refill rate per client IP)
+- [x] **Least-Connections Load Balancing** (`getLeastConnectionsBackend()` active connection tracking)
+- [x] **Graceful Shutdown** (`os.Interrupt`/`SIGTERM` handling & `sync.WaitGroup` in-flight request tracking)
 - [ ] TLS termination
 
 ## What this project demonstrates
 
 - Raw socket programming and manual HTTP parsing
 - Connection pooling design with idle connection expiration & capacity management
-- Concurrent programming in Go (goroutines, mutexes, race condition prevention)
-- Load balancing and failover design
+- Concurrent programming in Go (goroutines, mutexes, WaitGroups, race condition prevention)
+- Token-bucket rate limiting algorithms
+- Least-connections and load balancing algorithms
 - Externalized application configuration management
 - Observability & metrics collection in Prometheus format
+- Signal handling & graceful application shutdown patterns
 - Performance benchmarking and system architecture evaluation
