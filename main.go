@@ -269,10 +269,20 @@ func forwardToBackend(
 	return resp, backendConn, nil
 }
 
+var globalConfig *Config
+
 // Handle each client connection
 func handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
+	defer RecoverConnection(clientConn, "")
 	start := time.Now()
+
+	// Apply read/write timeouts if configured
+	if globalConfig != nil {
+		readTimeout := time.Duration(globalConfig.ReadTimeoutSeconds) * time.Second
+		writeTimeout := time.Duration(globalConfig.WriteTimeoutSeconds) * time.Second
+		SetConnTimeouts(clientConn, readTimeout, writeTimeout)
+	}
 
 	// Extract client IP (host only, stripping ephemeral port)
 	clientIP, _, err := net.SplitHostPort(clientConn.RemoteAddr().String())
@@ -450,6 +460,7 @@ func main() {
 		fmt.Println("Error loading config file:", err)
 		return
 	}
+	globalConfig = cfg
 
 	// Initialize global response cache
 	cacheTTL := time.Duration(cfg.CacheTTLSeconds) * time.Second

@@ -17,6 +17,9 @@ type Config struct {
 	LogJSON                       bool     `yaml:"log_json"`
 	CacheEnabled                  bool     `yaml:"cache_enabled"`
 	CacheTTLSeconds               int      `yaml:"cache_ttl_seconds"`
+	ReadTimeoutSeconds            int      `yaml:"read_timeout_seconds"`
+	WriteTimeoutSeconds           int      `yaml:"write_timeout_seconds"`
+	MaxBodyBytes                  int64    `yaml:"max_body_bytes"`
 }
 
 // loadConfig reads and unmarshals the YAML configuration file from path
