@@ -279,21 +279,28 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	// Read client's HTTP request to drain incoming TCP receive buffer
-	request, err := readRequest(clientConn)
+	rawRequest, err := readRequest(clientConn)
 	if err != nil {
 		fmt.Println("Error reading client request:", err)
 		return
 	}
 
+	// Extract or generate X-Request-ID
+	requestID, request := ExtractOrGenerateRequestID(rawRequest)
+
 	// Rate limit check per client IP
 	if !globalRateLimiter.Allow(clientIP) {
 		globalMetrics.RecordRequest("", true)
 		clientConn.Write([]byte(
-			"HTTP/1.1 429 Too Many Requests\r\n" +
-				"Content-Type: text/plain; charset=utf-8\r\n" +
-				"Content-Length: 19\r\n" +
-				"Connection: close\r\n\r\n" +
-				"Rate limit exceeded",
+			fmt.Sprintf(
+				"HTTP/1.1 429 Too Many Requests\r\n"+
+					"Content-Type: text/plain; charset=utf-8\r\n"+
+					"Content-Length: 19\r\n"+
+					"X-Request-ID: %s\r\n"+
+					"Connection: close\r\n\r\n"+
+					"Rate limit exceeded",
+				requestID,
+			),
 		))
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
@@ -309,11 +316,15 @@ func handleConnection(clientConn net.Conn) {
 
 		// All backends are unavailable
 		clientConn.Write([]byte(
-			"HTTP/1.1 503 Service Unavailable\r\n" +
-				"Content-Type: text/plain; charset=utf-8\r\n" +
-				"Content-Length: 21\r\n" +
-				"Connection: close\r\n\r\n" +
-				"All backends are down",
+			fmt.Sprintf(
+				"HTTP/1.1 503 Service Unavailable\r\n"+
+					"Content-Type: text/plain; charset=utf-8\r\n"+
+					"Content-Length: 21\r\n"+
+					"X-Request-ID: %s\r\n"+
+					"Connection: close\r\n\r\n"+
+					"All backends are down",
+				requestID,
+			),
 		))
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
@@ -335,7 +346,7 @@ func handleConnection(clientConn net.Conn) {
 		mu.Unlock()
 	}()
 
-	fmt.Println("Least-connections selected:", target.Address, "active:", activeCount)
+	fmt.Printf("[%s] Least-connections selected: %s (active: %d)\n", requestID, target.Address, activeCount)
 
 	// Forward request to backend
 	resp, backendConn, err := forwardToBackend(target, request)
@@ -345,14 +356,18 @@ func handleConnection(clientConn net.Conn) {
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		fmt.Println("Error talking to backend:", err)
+		fmt.Printf("[%s] Error talking to backend %s: %v\n", requestID, target.Address, err)
 
 		clientConn.Write([]byte(
-			"HTTP/1.1 502 Bad Gateway\r\n" +
-				"Content-Type: text/plain; charset=utf-8\r\n" +
-				"Content-Length: 13\r\n" +
-				"Connection: close\r\n\r\n" +
-				"Backend error",
+			fmt.Sprintf(
+				"HTTP/1.1 502 Bad Gateway\r\n"+
+					"Content-Type: text/plain; charset=utf-8\r\n"+
+					"Content-Length: 13\r\n"+
+					"X-Request-ID: %s\r\n"+
+					"Connection: close\r\n\r\n"+
+					"Backend error",
+				requestID,
+			),
 		))
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
 			tcpConn.CloseWrite()
@@ -360,6 +375,9 @@ func handleConnection(clientConn net.Conn) {
 
 		return
 	}
+
+	// Ensure X-Request-ID is present in response headers returned to client
+	InjectResponseRequestID(resp, requestID)
 
 	// Send backend response to client
 	err = resp.Write(clientConn)
@@ -369,7 +387,7 @@ func handleConnection(clientConn net.Conn) {
 		if target.CB != nil {
 			target.CB.RecordFailure()
 		}
-		fmt.Println("Error writing response to client:", err)
+		fmt.Printf("[%s] Error writing response to client: %v\n", requestID, err)
 
 		backendConn.Close()
 
