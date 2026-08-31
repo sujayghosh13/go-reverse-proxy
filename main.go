@@ -21,6 +21,7 @@ type Backend struct {
 	Address           string
 	Healthy           bool
 	ActiveConnections int
+	CB                *CircuitBreaker
 }
 
 // List of backend servers
@@ -105,7 +106,7 @@ func (p *ConnPool) Put(address string, conn net.Conn) {
 // Create the global connection pool
 var pool = NewConnPool()
 
-// Select the healthy backend with the fewest active connections
+// Select the healthy backend with the fewest active connections allowed by Circuit Breaker
 func getLeastConnectionsBackend() *Backend {
 	mu.Lock()
 	defer mu.Unlock()
@@ -113,6 +114,9 @@ func getLeastConnectionsBackend() *Backend {
 	var best *Backend
 	for _, backend := range backends {
 		if !backend.Healthy {
+			continue
+		}
+		if backend.CB != nil && !backend.CB.AllowRequest() {
 			continue
 		}
 		if best == nil || backend.ActiveConnections < best.ActiveConnections {
@@ -338,6 +342,9 @@ func handleConnection(clientConn net.Conn) {
 
 	if err != nil {
 		globalMetrics.RecordRequest(target.Address, true)
+		if target.CB != nil {
+			target.CB.RecordFailure()
+		}
 		fmt.Println("Error talking to backend:", err)
 
 		clientConn.Write([]byte(
@@ -359,6 +366,9 @@ func handleConnection(clientConn net.Conn) {
 
 	if err != nil {
 		globalMetrics.RecordRequest(target.Address, true)
+		if target.CB != nil {
+			target.CB.RecordFailure()
+		}
 		fmt.Println("Error writing response to client:", err)
 
 		backendConn.Close()
@@ -367,6 +377,9 @@ func handleConnection(clientConn net.Conn) {
 	}
 
 	globalMetrics.RecordRequest(target.Address, false)
+	if target.CB != nil {
+		target.CB.RecordSuccess()
+	}
 
 	// Put the backend connection back into the pool
 	pool.Put(target.Address, backendConn)
@@ -381,11 +394,21 @@ func main() {
 		return
 	}
 
+	cbThreshold := cfg.CircuitBreakerThreshold
+	if cbThreshold <= 0 {
+		cbThreshold = 3
+	}
+	cbCooldown := time.Duration(cfg.CircuitBreakerCooldownSeconds) * time.Second
+	if cbCooldown <= 0 {
+		cbCooldown = 5 * time.Second
+	}
+
 	// Initialize backend list from config
 	for _, addr := range cfg.Backends {
 		backends = append(backends, &Backend{
 			Address: addr,
 			Healthy: true,
+			CB:      NewCircuitBreaker(cbThreshold, cbCooldown),
 		})
 	}
 

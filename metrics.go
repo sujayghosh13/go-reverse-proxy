@@ -58,4 +58,19 @@ func (m *Metrics) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	for backend, count := range m.backendReqs {
 		fmt.Fprintf(w, "proxy_backend_requests_total{backend=\"%s\"} %d\n", backend, count)
 	}
+
+	fmt.Fprintln(w, "\n# HELP proxy_circuit_breaker_state Current state of backend circuit breaker (1 for active state).")
+	fmt.Fprintln(w, "# TYPE proxy_circuit_breaker_state gauge")
+	fmt.Fprintln(w, "# HELP proxy_circuit_breaker_tripped_total Total times circuit breaker tripped to open state.")
+	fmt.Fprintln(w, "# TYPE proxy_circuit_breaker_tripped_total counter")
+
+	mu.Lock()
+	for _, b := range backends {
+		if b.CB != nil {
+			stateStr := string(b.CB.State())
+			fmt.Fprintf(w, "proxy_circuit_breaker_state{backend=\"%s\",state=\"%s\"} 1\n", b.Address, stateStr)
+			fmt.Fprintf(w, "proxy_circuit_breaker_tripped_total{backend=\"%s\"} %d\n", b.Address, b.CB.TotalTripped())
+		}
+	}
+	mu.Unlock()
 }
