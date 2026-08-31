@@ -4,7 +4,7 @@ A high-performance reverse proxy and load balancer built from raw TCP sockets in
 
 ## Key Features
 
-- **Raw TCP Socket Processing:** Accepts incoming client HTTP requests over raw TCP listeners (`net.Listen`) and parses HTTP headers manually.
+- **TLS Termination (HTTPS Support):** Accepts secure HTTPS client connections over TLS listeners (`tls.Listen`) using X.509 certificates (`cert.pem` and `key.pem`). Terminates TLS encryption at the proxy and forwards plain HTTP/TCP traffic to backend nodes.
 - **Per-Client Token Bucket Rate Limiting:** Enforces rate limiting per client IP (5-token burst capacity, 1 token/sec refill rate) with compliant HTTP `429 Too Many Requests` responses.
 - **Least-Connections Load Balancing:** Dynamically routes client requests to the healthy backend with the lowest active connection count (`getLeastConnectionsBackend()`).
 - **Graceful Shutdown:** Catches `os.Interrupt` (Ctrl+C) and `SIGTERM` signals, closes the TCP listener to stop new connections, waits for all in-flight requests to complete via `sync.WaitGroup`, and exits cleanly.
@@ -19,31 +19,32 @@ A high-performance reverse proxy and load balancer built from raw TCP sockets in
 ## Architecture
 
 ```
-Client  --->  Token Bucket Rate Limiter (Per IP)
-                     |
-                     v
-             Reverse Proxy (Configured Port, e.g. :8080)
-                     |
-                     |--- Least-Connections / Connection Pool --->  Backend 1 (:9001)
-                     |                                              Backend 2 (:9002)
-                     |--- Active Health Checks ------------------>  Backend 3 (:9003)
-                     |
-                     v
-             Metrics Endpoint (:9090/metrics)
+Client (HTTPS/TLS)  --->  Token Bucket Rate Limiter (Per IP)
+                                 |
+                                 v
+                     TLS Termination Proxy (e.g. https://localhost:8080)
+                                 |
+                                 |--- Least-Connections / Connection Pool --->  Backend 1 (:9001) [HTTP]
+                                 |                                              Backend 2 (:9002) [HTTP]
+                                 |--- Active Health Checks ------------------>  Backend 3 (:9003) [HTTP]
+                                 |
+                                 v
+                         Metrics Endpoint (:9090/metrics)
 ```
 
-1. Client connects to the proxy on port configured in `config.yaml` (default `:8080`).
-2. Proxy checks rate limit for client IP (`globalRateLimiter.Allow(clientIP)`). If exceeded, returns HTTP 429.
-3. Proxy parses incoming HTTP headers line-by-line and extracts `Content-Length` for request body payloads.
-4. `getLeastConnectionsBackend()` selects the healthy backend with the fewest active connections.
-5. Proxy retrieves an idle TCP connection from `ConnPool` (verifying connection is $\le 30\text{s}$ old; dials a fresh connection if empty/stale).
-6. Request and body payload are forwarded to the backend.
-7. Backend response is parsed (`http.ReadResponse`) and written to the client (`resp.Write`).
-8. Connection is returned to `ConnPool` (if pool count $< 10$; otherwise connection is closed).
-9. Active connection count is decremented upon request completion.
-10. `globalMetrics.RecordRequest()` records success/error metrics.
-11. Background `healthCheck` goroutine pings backends on the interval specified in `config.yaml`.
-12. On Ctrl+C (`SIGTERM`), proxy closes listener, waits for in-flight requests via `sync.WaitGroup`, and shuts down gracefully.
+1. Client establishes secure HTTPS/TLS connection to the proxy on port configured in `config.yaml` (default `:8080`).
+2. Proxy terminates TLS using `cert.pem` and `key.pem`.
+3. Proxy checks rate limit for client IP (`globalRateLimiter.Allow(clientIP)`). If exceeded, returns HTTP 429.
+4. Proxy parses incoming HTTP headers line-by-line and extracts `Content-Length` for request body payloads.
+5. `getLeastConnectionsBackend()` selects the healthy backend with the fewest active connections.
+6. Proxy retrieves an idle TCP connection from `ConnPool` (verifying connection is $\le 30\text{s}$ old; dials a fresh connection if empty/stale).
+7. Request and body payload are forwarded to the backend over plain HTTP/TCP.
+8. Backend response is parsed (`http.ReadResponse`) and written back to client over the TLS connection.
+9. Connection is returned to `ConnPool` (if pool count $< 10$; otherwise connection is closed).
+10. Active connection count is decremented upon request completion.
+11. `globalMetrics.RecordRequest()` records success/error metrics.
+12. Background `healthCheck` goroutine pings backends on the interval specified in `config.yaml`.
+13. On Ctrl+C (`SIGTERM`), proxy closes listener, waits for in-flight requests via `sync.WaitGroup`, and shuts down gracefully.
 
 ## Configuration (`config.yaml`)
 
@@ -86,9 +87,10 @@ proxy_backend_requests_total{backend="localhost:9003"} 4
 ## Tech Stack
 
 - **Language:** Go 1.26+
+- **Security:** `crypto/tls` (X.509 key pair loading)
 - **Concurrency:** Goroutines, `sync.Mutex`, `sync.WaitGroup`
 - **Config Parser:** `gopkg.in/yaml.v3`
-- **Networking:** `net.Listen`, `net.Dial`, `bufio`, `io`, `net/http`
+- **Networking:** `net.Listen`, `tls.Listen`, `net.Dial`, `bufio`, `io`, `net/http`
 
 ## Running Locally
 
@@ -119,18 +121,23 @@ go run backends/backend2.go   # port 9002
 go run backends/backend3.go   # port 9003
 ```
 
-2. Start the reverse proxy:
+2. Generate self-signed TLS certificates (if needed):
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
+```
+
+3. Start the reverse proxy:
 ```bash
 go run .
 ```
 
-3. Test proxy traffic & metrics:
+4. Test HTTPS traffic & metrics:
 ```bash
-# Proxy HTTP GET
-curl http://localhost:8080/
+# Proxy HTTPS GET (use -k for self-signed certs)
+curl -k https://localhost:8080/
 
-# Proxy HTTP POST with Body
-curl -X POST -d "Hello Reverse Proxy" http://localhost:8080/
+# Proxy HTTPS POST with Body
+curl -k -X POST -d "Hello TLS Reverse Proxy" https://localhost:8080/
 
 # Fetch Prometheus Metrics
 curl http://localhost:9090/metrics
@@ -160,11 +167,12 @@ Tested with [`hey`](https://github.com/rakyll/hey), 2000 requests at 50 concurre
 - [x] **Per-client Token Bucket Rate Limiting** (5 burst tokens, 1 token/sec refill rate per client IP)
 - [x] **Least-Connections Load Balancing** (`getLeastConnectionsBackend()` active connection tracking)
 - [x] **Graceful Shutdown** (`os.Interrupt`/`SIGTERM` handling & `sync.WaitGroup` in-flight request tracking)
-- [ ] TLS termination
+- [x] **TLS Termination** (`crypto/tls`, `tls.Listen`, `cert.pem` & `key.pem`)
 
 ## What this project demonstrates
 
 - Raw socket programming and manual HTTP parsing
+- TLS termination using Go's `crypto/tls` package
 - Connection pooling design with idle connection expiration & capacity management
 - Concurrent programming in Go (goroutines, mutexes, WaitGroups, race condition prevention)
 - Token-bucket rate limiting algorithms
