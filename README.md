@@ -473,7 +473,7 @@ Future architecture enhancements under consideration:
 
 ---
 
-## 📝 Resume / Portfolio Summary
+## 📝 Summary
 
 > **Go Reverse Proxy & Load Balancer:** Designed and built a high-performance, resilient HTTP/HTTPS reverse proxy and load balancer in Go from raw TCP sockets (`net.Listen`, `net.Dial`, `crypto/tls`) without relying on standard `net/http` proxy abstractions. Implemented least-connections load balancing, per-backend circuit breaking (`CLOSED`/`OPEN`/`HALF-OPEN`), token-bucket rate limiting, in-memory response caching, TLS termination, and persistent TCP connection pooling. Built for cloud-native operational standards with Go 1.21 `log/slog` structured logging, Prometheus metrics, a real-time web dashboard, Kubernetes liveness/readiness probes, Docker Compose containerization, and a GitHub Actions CI pipeline. Verified via comprehensive automated unit/integration tests (`go test -race`) and microbenchmarks demonstrating a ~33% latency reduction through socket reuse.
 
